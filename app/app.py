@@ -45,40 +45,55 @@ st.set_page_config(page_title="Interactive Stock Dashboard", layout="wide")
 # -----------------------
 
 @st.cache_data(ttl=300)
-def fetch_stock_data(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
+def fetch_stock_from_sql(ticker: str, start: str, end: str) -> pd.DataFrame:
     """
-    - If local DB available (get_engine), fetch from SQL.
-    - Otherwise fetch from yfinance for cloud deployment.
-    Dates should be YYYY-MM-DD strings.
+    Unified fetch function used by the UI.
+    - If local DB available, read from dbo.stock_daily between start/end.
+    - Otherwise fallback to yfinance (cloud friendly).
+    - start/end should be 'YYYY-MM-DD' (strings) or convertible.
     """
-    # --- LOCAL DB path ---
+    # Normalize inputs
+    start = pd.to_datetime(start).strftime("%Y-%m-%d")
+    end   = pd.to_datetime(end).strftime("%Y-%m-%d")
+
     if USE_LOCAL_DB and get_engine is not None:
         engine = get_engine()
         query = text("""
-            SELECT [stock_date], [ticker], [open], [high], [low], [close], [adj_close], [volume]
-            FROM dbo.stock_daily
-            WHERE ticker = :ticker AND stock_date BETWEEN :start AND :end
-            ORDER BY [stock_date] ASC
+                SELECT
+                [stock_date], [ticker], [open], [high], [low], [close], [adj_close], [volume]
+                FROM dbo.stock_daily
+                WHERE ticker = :ticker
+                AND stock_date BETWEEN :start AND :end
+                ORDER BY [stock_date] ASC
         """)
         with engine.connect() as conn:
-            df = pd.read_sql(query, conn, params={"ticker": ticker, "start": start_date, "end": end_date})
+            df = pd.read_sql(query, conn, params={"ticker": ticker, "start": start, "end": end})
     else:
-        # --- CLOUD path: use yfinance ---
-        import yfinance as yf
-        # yfinance accepts period or start/end; we'll use start/end
-        df = yf.download(ticker, start=start_date, end=end_date, interval="1d", progress=False)
-        df = df.reset_index().rename(columns={
-            "Date": "stock_date", "Open": "open", "High": "high",
-            "Low": "low", "Close": "close", "Adj Close": "adj_close", "Volume": "volume"
-        })
-        df['ticker'] = ticker
+        # yfinance fallback (works on Streamlit Cloud)
+        df = yf.download(ticker, start=start, end=end, interval="1d", progress=False)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            df = df.reset_index().rename(columns={
+                "Date": "stock_date",
+                "Open": "open",
+                "High": "high",
+                "Low": "low",
+                "Close": "close",
+                "Adj Close": "adj_close",
+                "Volume": "volume"
+            })
+            df["ticker"] = ticker
+        else:
+            # return empty DF with expected columns to avoid downstream errors
+            cols = ["stock_date","ticker","open","high","low","close","adj_close","volume"]
+            return pd.DataFrame(columns=cols)
 
-    # normalize types and return
-    df['stock_date'] = pd.to_datetime(df['stock_date'])
-    numeric_cols = ['open','high','low','close','adj_close','volume']
-    for c in numeric_cols:
+    # Post-process: types and ordering
+    df["stock_date"] = pd.to_datetime(df["stock_date"])
+    for c in ["open","high","low","close","adj_close","volume"]:
         if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors='coerce')
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.sort_values("stock_date").reset_index(drop=True)
     return df
 
 
