@@ -1,0 +1,7 @@
+streamlit>=1.17.0
+pandas>=2.0
+numpy>=1.23
+plotly>=5.15
+sqlalchemy>=2.0
+python-dotenv>=1.0
+yfinance>=0.2
