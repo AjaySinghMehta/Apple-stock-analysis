@@ -20,32 +20,67 @@ project_root = Path(__file__).resolve().parents[1]  # go one level up from /app
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-from src.db import get_engine  # your existing connection provider
+# ---------- DB import: try local DB, otherwise fall back to None ----------
+USE_LOCAL_DB = False
+get_engine = None
+
+try:
+    # Attempt to import local DB connector only if running locally.
+    # This will fail on Streamlit Cloud if pyodbc / ODBC driver isn't available.
+    # We set a flag so the rest of the app can fall back to yfinance.
+    from src.db import get_engine  # local-only
+    USE_LOCAL_DB = True
+    st.sidebar.success("Using local SQL Server for data")
+except Exception as e:
+    # Running on cloud (or import failed). We'll fetch from yfinance instead.
+    get_engine = None
+    USE_LOCAL_DB = False
+    st.sidebar.warning("Local DB not available — falling back to yfinance (cloud mode)")
+
 
 st.set_page_config(page_title="Interactive Stock Dashboard", layout="wide")
 
 # -----------------------
 # Helper: fetch data
 # -----------------------
-@st.cache_data(ttl=300)
-def fetch_stock_from_sql(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
-    engine = get_engine()
-    query = text("""
-    SELECT 
-        [stock_date], [ticker], [open], [high], [low], [close], [adj_close], [volume]
-        FROM dbo.stock_daily
-        WHERE ticker = :ticker 
-        AND stock_date BETWEEN :start AND :end
-        ORDER BY stock_date ASC
-    """)
 
-    with engine.connect() as conn:
-        df = pd.read_sql(query, conn, params={"ticker": ticker, "start": start_date, "end": end_date})
-    # ensure types
+@st.cache_data(ttl=300)
+def fetch_stock_data(ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """
+    - If local DB available (get_engine), fetch from SQL.
+    - Otherwise fetch from yfinance for cloud deployment.
+    Dates should be YYYY-MM-DD strings.
+    """
+    # --- LOCAL DB path ---
+    if USE_LOCAL_DB and get_engine is not None:
+        engine = get_engine()
+        query = text("""
+            SELECT [stock_date], [ticker], [open], [high], [low], [close], [adj_close], [volume]
+            FROM dbo.stock_daily
+            WHERE ticker = :ticker AND stock_date BETWEEN :start AND :end
+            ORDER BY [stock_date] ASC
+        """)
+        with engine.connect() as conn:
+            df = pd.read_sql(query, conn, params={"ticker": ticker, "start": start_date, "end": end_date})
+    else:
+        # --- CLOUD path: use yfinance ---
+        import yfinance as yf
+        # yfinance accepts period or start/end; we'll use start/end
+        df = yf.download(ticker, start=start_date, end=end_date, interval="1d", progress=False)
+        df = df.reset_index().rename(columns={
+            "Date": "stock_date", "Open": "open", "High": "high",
+            "Low": "low", "Close": "close", "Adj Close": "adj_close", "Volume": "volume"
+        })
+        df['ticker'] = ticker
+
+    # normalize types and return
     df['stock_date'] = pd.to_datetime(df['stock_date'])
-    numeric_cols = ['open', 'high', 'low', 'close', 'adj_close', 'volume']
-    df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
+    numeric_cols = ['open','high','low','close','adj_close','volume']
+    for c in numeric_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
     return df
+
 
 # -----------------------
 # Analysis helpers
