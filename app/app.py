@@ -239,11 +239,54 @@ if st.sidebar.button("Fetch & Analyze"):
 
     # KPIs
     st.subheader("📊 Key Metrics")
+    # ---- Safe KPI block (replace the original KPI lines with this) ----
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Start Date", df["stock_date"].min().strftime("%Y-%m-%d"))
-    col2.metric("End Date", df["stock_date"].max().strftime("%Y-%m-%d"))
-    col3.metric("Start Price", f"${df['close'].iloc[0]:,.2f}")
-    col4.metric("Latest Price", f"${df['close'].iloc[-1]:,.2f}")
+
+    # Defensive helpers
+    def _safe_price_value(series, idx=0):
+        """Return a float price if possible, otherwise None"""
+        try:
+            if series is None or len(series) == 0:
+                return None
+            val = series.iloc[int(idx)]
+            # convert to float if possible
+            if pd.isna(val):
+                return None
+            return float(val)
+        except Exception:
+            return None
+
+    def _format_price(val):
+        if val is None:
+            return "N/A"
+        try:
+            return f"${val:,.2f}"
+        except Exception:
+            return str(val)
+
+    # Ensure stock_date is datetime and sorted (safe normalization)
+    try:
+        df['stock_date'] = pd.to_datetime(df['stock_date'])
+    except Exception:
+        pass
+    if 'stock_date' in df.columns:
+        df = df.sort_values('stock_date').reset_index(drop=True)
+
+    start_date_val = df['stock_date'].min() if 'stock_date' in df.columns and len(df) else None
+    end_date_val   = df['stock_date'].max() if 'stock_date' in df.columns and len(df) else None
+
+    # Convert dates to strings for st.metric (safe)
+    col1.metric("Start Date", start_date_val.strftime("%Y-%m-%d") if start_date_val is not None else "N/A")
+    col2.metric("End Date", end_date_val.strftime("%Y-%m-%d") if end_date_val is not None else "N/A")
+
+    # Safe price extraction and formatting
+    start_price = _safe_price_value(df.get('close'))    # returns float or None
+    latest_price = _safe_price_value(df.get('close'), idx=-1)
+
+    col3.metric("Start Price", _format_price(start_price))
+    col4.metric("Latest Close", _format_price(latest_price))
+    # -------------------------------------------------------------------
+
 
     # Tabs
     tabs = st.tabs(["Price Trend","Volume","Moving Avg","Cumulative","Monthly Avg","Forecast"])
