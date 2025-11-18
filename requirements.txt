@@ -2,10 +2,7 @@ streamlit==1.31.1
 pandas==2.2.3
 numpy==1.26.4
 plotly==5.20.0
-
 sqlalchemy==2.0.25
-pyodbc==5.1.0
-
 yfinance==0.2.34
 python-dotenv==1.0.1
 requests==2.31.0
