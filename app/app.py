@@ -1,4 +1,13 @@
 # app.py
+"""
+Complete Streamlit app for Apple stock analytics.
+Works with:
+ - local SQL Server via src.db.get_engine() (set USE_LOCAL_DB=1 in .env)
+ - yfinance fallback (for Streamlit Cloud / remote)
+Safe/robust: normalizes yfinance MultiIndex, guards missing columns, replaces deprecated args.
+Paste this file at your project root (same level as src/).
+"""
+
 import sys
 from pathlib import Path
 from datetime import timedelta
@@ -11,44 +20,93 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 
-# Allow imports like `from src.db import get_engine`
+# Ensure project root in path so `from src.db import get_engine` can work
 project_root = Path(__file__).resolve().parents[0]
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 st.set_page_config(page_title="Stock Analytics", layout="wide")
 
-# -------------------------
-# Helper to optionally load local DB engine
-# -------------------------
+# ---- helper to optionally load local DB engine ----
 def _try_get_engine():
-    """
-    Try importing get_engine from src.db. Return function or None.
-    src/db.py should expose get_engine() -> SQLAlchemy engine.
-    """
     try:
         from src.db import get_engine  # type: ignore
         return get_engine
     except Exception:
         return None
 
-
 USE_LOCAL_DB_DEFAULT = os.environ.get("USE_LOCAL_DB", "0") in ("1", "true", "True")
 
-# -------------------------
-# Fetching (SQL or yfinance fallback)
-# -------------------------
+# ---- robust fetch_stock ----
 @st.cache_data(ttl=300)
 def fetch_stock(ticker: str, start, end, use_local: bool = False) -> pd.DataFrame:
     """
-    Returns DataFrame with columns:
-      stock_date, ticker, open, high, low, close, adj_close, volume
-    Tries local SQL if use_local True and src.db.get_engine available. Otherwise uses yfinance.
+    Returns DataFrame with canonical columns:
+    ['stock_date','ticker','open','high','low','close','adj_close','volume']
+
+    Tries local SQL (if requested & available), otherwise falls back to yfinance.
     """
+
     start = pd.to_datetime(start).normalize()
     end = pd.to_datetime(end).normalize()
 
-    # --- Local SQL Mode ---
+    def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+        # If index is datetime, bring it back as column
+        if isinstance(df.index, pd.DatetimeIndex):
+            df = df.reset_index()
+
+        # Normalize column names
+        df.columns = [str(c).lower().replace(" ", "_") for c in df.columns]
+
+        # Common date name conversions
+        if "stock_date" not in df.columns and "date" in df.columns:
+            df = df.rename(columns={"date": "stock_date"})
+
+        # If stock_date missing, try detect any datetime-like column
+        if "stock_date" not in df.columns:
+            for col in df.columns:
+                try:
+                    sample = pd.to_datetime(df[col].iloc[:5], errors="coerce")
+                    if sample.notna().any():
+                        df = df.rename(columns={col: "stock_date"})
+                        break
+                except Exception:
+                    continue
+
+        # Ensure stock_date exists
+        if "stock_date" not in df.columns:
+            df["stock_date"] = pd.NaT
+
+        # Map variants to canonical names
+        col_map = {}
+        for src in list(df.columns):
+            if src in ("open", "high", "low", "close", "volume"):
+                col_map[src] = src
+            if "adj" in src and "close" in src:
+                col_map[src] = "adj_close"
+            if src == "adjclose":
+                col_map[src] = "adj_close"
+
+        if col_map:
+            df = df.rename(columns=col_map)
+
+        # Ensure required columns exist
+        for col in ["open", "high", "low", "close", "adj_close", "volume"]:
+            if col not in df.columns:
+                df[col] = np.nan
+
+        # Normalize date column
+        df["stock_date"] = pd.to_datetime(df["stock_date"], errors="coerce").dt.normalize()
+
+        # Ensure ticker
+        if "ticker" not in df.columns:
+            df["ticker"] = ticker
+
+        # Sort and reset
+        df = df.sort_values("stock_date", na_position="last").reset_index(drop=True)
+        return df
+
+    # --- Try local SQL if requested ---
     if use_local:
         get_engine = _try_get_engine()
         if get_engine:
@@ -64,78 +122,46 @@ def fetch_stock(ticker: str, start, end, use_local: bool = False) -> pd.DataFram
                     """
                 )
                 with engine.connect() as conn:
-                    df = pd.read_sql(query, conn, params={
+                    df_sql = pd.read_sql(query, conn, params={
                         "ticker": ticker,
                         "start": start.strftime("%Y-%m-%d"),
                         "end": end.strftime("%Y-%m-%d")
                     })
-                if not df.empty:
-                    df["stock_date"] = pd.to_datetime(df["stock_date"]).dt.normalize()
-                    return df.sort_values("stock_date").reset_index(drop=True)
-                else:
-                    # If DB returned no rows, fall through to yfinance fallback
-                    st.info("Local SQL returned no rows for that ticker/date range. Using yfinance fallback.")
+                return _normalize_df(df_sql)
             except Exception as e:
-                # Avoid leaking connection strings. Show a friendly message only.
-                st.info("Local SQL Server unavailable or failed. Falling back to yfinance.")
-                # Optionally show minimal debug for developer:
-                st.write("Debug (local SQL):", repr(e))  # safe short message
+                # Friendly fallback message; avoid leaking secrets
+                st.info("Local SQL Server unavailable or returned unexpected columns. Falling back to yfinance.")
+                # provide short debug info for developer only
+                st.write("Debug (local SQL):", repr(e))
 
-    # --- Cloud / fallback: yfinance ---
+    # --- yfinance fallback ---
     try:
-        import yfinance as yf  # imported locally to avoid import errors on environments without it
-    except Exception as e:
-        st.error("yfinance is not available in the environment. Install yfinance or enable local DB.")
-        raise
+        import yfinance as yf  # local import to avoid ImportError in some envs
+    except Exception:
+        st.error("yfinance not available. Install yfinance or enable local DB.")
+        return pd.DataFrame(columns=["stock_date","ticker","open","high","low","close","adj_close","volume"])
 
-    # yfinance treats `end` as exclusive in some cases; add 1 day for inclusivity
     yf_end = end + pd.Timedelta(days=1)
     raw = yf.download(ticker, start=start.strftime("%Y-%m-%d"), end=yf_end.strftime("%Y-%m-%d"),
                       interval="1d", progress=False, threads=False)
 
     if raw is None or raw.empty:
-        return pd.DataFrame(columns=["stock_date", "ticker", "open", "high", "low", "close", "adj_close", "volume"])
+        return pd.DataFrame(columns=["stock_date","ticker","open","high","low","close","adj_close","volume"])
 
-    # Normalize columns: handle MultiIndex and different casing
+    # If MultiIndex columns (('Close','AAPL')), collapse to first level
     if isinstance(raw.columns, pd.MultiIndex):
-        # e.g. ('Close','AAPL') -> 'Close'
-        raw.columns = [col[0] for col in raw.columns]
+        raw.columns = [c[0] for c in raw.columns]
 
-    # standardize to lowercase and underscores for consistency
-    raw.columns = [str(c).lower().replace(" ", "_") for c in raw.columns]
-
-    df = raw.reset_index().rename(columns={
-        "date": "stock_date",
-        "open": "open",
-        "high": "high",
-        "low": "low",
-        "close": "close",
-        "adj_close": "adj_close",
-        "volume": "volume"
-    })
-
-    # ensure required columns exist (fill with NaN if missing)
-    for col in ["open", "high", "low", "close", "adj_close", "volume"]:
-        if col not in df.columns:
-            df[col] = np.nan
-
-    df["ticker"] = ticker
-    df["stock_date"] = pd.to_datetime(df["stock_date"]).dt.normalize()
-    return df.sort_values("stock_date").reset_index(drop=True)
+    return _normalize_df(raw)
 
 
-# -------------------------
-# Analysis helpers
-# -------------------------
+# ---- analysis helpers ----
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df = df.sort_values("stock_date")
-    # If close doesn't exist or empty, return df with expected columns
+    df = df.copy().sort_values("stock_date")
     if "close" not in df.columns or df["close"].dropna().empty:
         for col in ["daily_return", "cumulative", "MA20", "MA50", "MA100"]:
             df[col] = np.nan
         return df
-
     df["daily_return"] = df["close"].pct_change()
     df["cumulative"] = (1 + df["daily_return"]).cumprod() - 1
     df["MA20"] = df["close"].rolling(20).mean()
@@ -182,7 +208,6 @@ def linear_forecast(df: pd.DataFrame, n_days: int = 30, fit_days: int = 120) -> 
         a, b = np.polyfit(x, y, 1)
     except Exception:
         return None
-
     start_date = sub["stock_date"].iloc[-1] + pd.Timedelta(days=1)
     future_dates = pd.bdate_range(start=start_date, periods=n_days)
     fx = np.arange(len(sub), len(sub) + n_days)
@@ -190,9 +215,7 @@ def linear_forecast(df: pd.DataFrame, n_days: int = 30, fit_days: int = 120) -> 
     return pd.DataFrame({"stock_date": future_dates.normalize(), "forecast_close": fy})
 
 
-# -------------------------
-# Plotting helpers
-# -------------------------
+# ---- plotting helpers ----
 def p_price(df: pd.DataFrame) -> go.Figure:
     fig = go.Figure()
     if "stock_date" in df.columns and "close" in df.columns:
@@ -205,7 +228,6 @@ def p_price(df: pd.DataFrame) -> go.Figure:
 
 def p_volume(df: pd.DataFrame):
     if "stock_date" not in df.columns or "volume" not in df.columns:
-        # empty figure with message
         fig = go.Figure()
         fig.update_layout(title_text="No volume data available for this selection.")
         return fig
@@ -231,13 +253,10 @@ def p_cum(df: pd.DataFrame):
     return px.line(df, x="stock_date", y="cumulative", labels={"cumulative": "Cumulative Return", "stock_date": "Date"})
 
 
-# -------------------------
-# UI
-# -------------------------
+# ---- UI ----
 st.title("📊 Interactive Stock Analytics (SQL + Streamlit + Plotly)")
 st.sidebar.header("Query Options")
 
-# ticker input (allow typing)
 ticker = st.sidebar.text_input("Ticker", value="AAPL").upper()
 range_opt = st.sidebar.selectbox("Range", ["5y", "3y", "1y", "6m", "1m", "custom"], index=0)
 use_local = st.sidebar.checkbox("Use Local SQL Server", value=USE_LOCAL_DB_DEFAULT)
@@ -264,7 +283,7 @@ st.sidebar.write(f"Fetching **{ticker}** from {start.date()} → {end.date()}")
 
 fetch_btn = st.sidebar.button("Fetch & Analyze")
 
-# session state for last df to avoid re-fetch on simple UI interactions
+# session state to avoid refetch on simple UI interactions
 if "last_df" not in st.session_state:
     st.session_state["last_df"] = None
     st.session_state["last_ticker"] = None
@@ -288,7 +307,7 @@ if df is not None:
     st.subheader(f"📌 Key Metrics — {st.session_state.get('last_ticker','')}")
     c1, c2, c3, c4 = st.columns(4)
 
-    # Start & End safe display
+    # Safe display of start/end
     try:
         c1.metric("Start Date", df["stock_date"].min().strftime("%Y-%m-%d"))
         c2.metric("End Date", df["stock_date"].max().strftime("%Y-%m-%d"))
@@ -296,7 +315,7 @@ if df is not None:
         c1.metric("Start Date", "N/A")
         c2.metric("End Date", "N/A")
 
-    # Start Price & Latest Close safe display
+    # Safe display of prices
     if "close" in df.columns and not df["close"].dropna().empty:
         try:
             c3.metric("Start Price", f"${df['close'].iloc[0]:,.2f}")
@@ -345,6 +364,7 @@ if df is not None:
 
     csv = df.to_csv(index=False).encode("utf-8")
     st.download_button("Download CSV", data=csv, file_name=f"{ticker}_stock.csv", mime="text/csv")
+
 else:
     st.info("No data loaded yet. Choose options in the sidebar and click **Fetch & Analyze**.")
     st.caption("If you want to load from your local SQL Server, check 'Use Local SQL Server' and ensure src/db.py exists with get_engine().")
