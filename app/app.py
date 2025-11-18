@@ -1,11 +1,11 @@
 # app.py
 """
 Complete Streamlit app for Apple stock analytics.
-Works with:
- - local SQL Server via src.db.get_engine() (set USE_LOCAL_DB=1 in .env)
- - yfinance fallback (for Streamlit Cloud / remote)
-Safe/robust: normalizes yfinance MultiIndex, guards missing columns, replaces deprecated args.
-Paste this file at your project root (same level as src/).
+- Works with local SQL Server via src.db.get_engine() (set USE_LOCAL_DB=1 in .env)
+- Works on Streamlit Cloud using yfinance fallback (set USE_LOCAL_DB=0 on cloud)
+- Robust yfinance fetching with retries and history() fallback
+- Normalizes yfinance MultiIndex columns and guards missing columns
+- Uses width="stretch" (Streamlit deprecation-safe)
 """
 
 import sys
@@ -13,12 +13,16 @@ from pathlib import Path
 from datetime import timedelta
 import os
 from typing import Optional
+import time
+from json import JSONDecodeError
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
+from requests import Session
+from requests.exceptions import RequestException
 
 # Ensure project root in path so `from src.db import get_engine` can work
 project_root = Path(__file__).resolve().parents[0]
@@ -37,32 +41,30 @@ def _try_get_engine():
 
 USE_LOCAL_DB_DEFAULT = os.environ.get("USE_LOCAL_DB", "0") in ("1", "true", "True")
 
-# ---- robust fetch_stock ----
+# ---- robust fetch_stock (retries + session + fallback) ----
 @st.cache_data(ttl=300)
 def fetch_stock(ticker: str, start, end, use_local: bool = False) -> pd.DataFrame:
     """
-    Returns DataFrame with canonical columns:
+    Returns canonical DataFrame with columns:
     ['stock_date','ticker','open','high','low','close','adj_close','volume']
-
-    Tries local SQL (if requested & available), otherwise falls back to yfinance.
+    Tries local SQL (if requested & available) otherwise uses yfinance with retries and fallback.
     """
-
     start = pd.to_datetime(start).normalize()
     end = pd.to_datetime(end).normalize()
 
     def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
-        # If index is datetime, bring it back as column
+        # If index is datetime, reset it to a column
         if isinstance(df.index, pd.DatetimeIndex):
             df = df.reset_index()
 
-        # Normalize column names
+        # Lowercase and normalize column names
         df.columns = [str(c).lower().replace(" ", "_") for c in df.columns]
 
-        # Common date name conversions
+        # Map date column variants
         if "stock_date" not in df.columns and "date" in df.columns:
             df = df.rename(columns={"date": "stock_date"})
 
-        # If stock_date missing, try detect any datetime-like column
+        # If still no stock_date, try to detect a datetime-like column
         if "stock_date" not in df.columns:
             for col in df.columns:
                 try:
@@ -77,7 +79,7 @@ def fetch_stock(ticker: str, start, end, use_local: bool = False) -> pd.DataFram
         if "stock_date" not in df.columns:
             df["stock_date"] = pd.NaT
 
-        # Map variants to canonical names
+        # Normalize adj_close variants and other column names
         col_map = {}
         for src in list(df.columns):
             if src in ("open", "high", "low", "close", "volume"):
@@ -86,7 +88,6 @@ def fetch_stock(ticker: str, start, end, use_local: bool = False) -> pd.DataFram
                 col_map[src] = "adj_close"
             if src == "adjclose":
                 col_map[src] = "adj_close"
-
         if col_map:
             df = df.rename(columns=col_map)
 
@@ -98,11 +99,11 @@ def fetch_stock(ticker: str, start, end, use_local: bool = False) -> pd.DataFram
         # Normalize date column
         df["stock_date"] = pd.to_datetime(df["stock_date"], errors="coerce").dt.normalize()
 
-        # Ensure ticker
+        # Ensure ticker exists
         if "ticker" not in df.columns:
             df["ticker"] = ticker
 
-        # Sort and reset
+        # Sort and reset index
         df = df.sort_values("stock_date", na_position="last").reset_index(drop=True)
         return df
 
@@ -129,30 +130,67 @@ def fetch_stock(ticker: str, start, end, use_local: bool = False) -> pd.DataFram
                     })
                 return _normalize_df(df_sql)
             except Exception as e:
-                # Friendly fallback message; avoid leaking secrets
                 st.info("Local SQL Server unavailable or returned unexpected columns. Falling back to yfinance.")
-                # provide short debug info for developer only
+                # short debug message (safe)
                 st.write("Debug (local SQL):", repr(e))
 
-    # --- yfinance fallback ---
+    # --- yfinance fallback with retries ---
     try:
-        import yfinance as yf  # local import to avoid ImportError in some envs
+        import yfinance as yf
     except Exception:
         st.error("yfinance not available. Install yfinance or enable local DB.")
-        return pd.DataFrame(columns=["stock_date","ticker","open","high","low","close","adj_close","volume"])
+        return pd.DataFrame(columns=["stock_date", "ticker", "open", "high", "low", "close", "adj_close", "volume"])
 
-    yf_end = end + pd.Timedelta(days=1)
-    raw = yf.download(ticker, start=start.strftime("%Y-%m-%d"), end=yf_end.strftime("%Y-%m-%d"),
-                      interval="1d", progress=False, threads=False)
+    # prepare a requests Session (helps in some environments)
+    sess = Session()
+    sess.headers.update({
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+    })
 
-    if raw is None or raw.empty:
-        return pd.DataFrame(columns=["stock_date","ticker","open","high","low","close","adj_close","volume"])
+    yf_end = end + pd.Timedelta(days=1)  # inclusive end
+    attempts = 3
+    backoff = 1.0
 
-    # If MultiIndex columns (('Close','AAPL')), collapse to first level
-    if isinstance(raw.columns, pd.MultiIndex):
-        raw.columns = [c[0] for c in raw.columns]
+    for attempt in range(1, attempts + 1):
+        try:
+            raw = yf.download(
+                ticker,
+                start=start.strftime("%Y-%m-%d"),
+                end=yf_end.strftime("%Y-%m-%d"),
+                interval="1d",
+                progress=False,
+                threads=False,
+                session=sess
+            )
+            # treat empty as failure for retry
+            if raw is None or raw.empty:
+                raise ValueError("yfinance returned empty dataframe")
+            if isinstance(raw.columns, pd.MultiIndex):
+                raw.columns = [c[0] for c in raw.columns]
+            return _normalize_df(raw)
+        except (JSONDecodeError, ValueError, RequestException, Exception) as e:
+            msg = f"yfinance attempt {attempt} failed: {repr(e)}"
+            st.write(msg)
+            print(msg)
+            if attempt < attempts:
+                time.sleep(backoff)
+                backoff *= 2
+                continue
 
-    return _normalize_df(raw)
+    # Final fallback: try yf.Ticker.history()
+    try:
+        t = yf.Ticker(ticker)
+        hist = t.history(start=start.strftime("%Y-%m-%d"), end=yf_end.strftime("%Y-%m-%d"), interval="1d")
+        if hist is not None and not hist.empty:
+            if isinstance(hist.columns, pd.MultiIndex):
+                hist.columns = [c[0] for c in hist.columns]
+            return _normalize_df(hist)
+    except Exception as e:
+        st.write("yfinance.history fallback failed:", repr(e))
+        print("yfinance.history fallback failed:", repr(e))
+
+    st.error("Failed to fetch data from yfinance. Please try again later or use local DB.")
+    return pd.DataFrame(columns=["stock_date", "ticker", "open", "high", "low", "close", "adj_close", "volume"])
 
 
 # ---- analysis helpers ----
@@ -283,7 +321,13 @@ st.sidebar.write(f"Fetching **{ticker}** from {start.date()} → {end.date()}")
 
 fetch_btn = st.sidebar.button("Fetch & Analyze")
 
-# session state to avoid refetch on simple UI interactions
+# Debug button (temporary) - click to run a quick AAPL fetch and print debug info
+if st.sidebar.button("Quick debug fetch (AAPL)"):
+    debug_df = fetch_stock("AAPL", "2020-01-01", pd.Timestamp.today(), use_local=False)
+    st.write("DEBUG - Columns:", debug_df.columns.tolist())
+    st.write(debug_df.head(3))
+
+# session state for last df
 if "last_df" not in st.session_state:
     st.session_state["last_df"] = None
     st.session_state["last_ticker"] = None
@@ -307,7 +351,7 @@ if df is not None:
     st.subheader(f"📌 Key Metrics — {st.session_state.get('last_ticker','')}")
     c1, c2, c3, c4 = st.columns(4)
 
-    # Safe display of start/end
+    # Safe start/end
     try:
         c1.metric("Start Date", df["stock_date"].min().strftime("%Y-%m-%d"))
         c2.metric("End Date", df["stock_date"].max().strftime("%Y-%m-%d"))
@@ -315,7 +359,7 @@ if df is not None:
         c1.metric("Start Date", "N/A")
         c2.metric("End Date", "N/A")
 
-    # Safe display of prices
+    # Safe prices
     if "close" in df.columns and not df["close"].dropna().empty:
         try:
             c3.metric("Start Price", f"${df['close'].iloc[0]:,.2f}")
@@ -364,7 +408,6 @@ if df is not None:
 
     csv = df.to_csv(index=False).encode("utf-8")
     st.download_button("Download CSV", data=csv, file_name=f"{ticker}_stock.csv", mime="text/csv")
-
 else:
     st.info("No data loaded yet. Choose options in the sidebar and click **Fetch & Analyze**.")
     st.caption("If you want to load from your local SQL Server, check 'Use Local SQL Server' and ensure src/db.py exists with get_engine().")
