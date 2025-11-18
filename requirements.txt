@@ -4,7 +4,7 @@ numpy==2.3.5
 plotly==6.4.0
 sqlalchemy==2.0.44
 yfinance==0.2.66
-pyodbc==5.1.0
+
 python-dotenv==1.2.1
 requests==2.32.5
-psycopg2-binary==2.9.9
+
