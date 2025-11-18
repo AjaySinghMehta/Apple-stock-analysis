@@ -1,0 +1,34 @@
+# ===========================
+# STREAMLIT SERVER SETTINGS
+# ===========================
+[server]
+# Fixes "inotify watch limit reached" error
+fileWatcherType = "poll"
+
+# Prevent reruns on every file save (more stable on cloud)
+runOnSave = false
+
+# Allow wider dashboards
+enableXsrfProtection = true
+enableCORS = false
+
+
+# ===========================
+# CLIENT SETTINGS
+# ===========================
+[client]
+# Disable telemetry (optional)
+toolbarMode = "viewer"
+
+
+# ===========================
+# THEME SETTINGS (DARK MODE)
+# ===========================
+[theme]
+base = "dark"
+primaryColor = "#4CAF50"              # green accent
+backgroundColor = "#0E1117"           # dark background
+secondaryBackgroundColor = "#1A1C23"  # sidebar cards etc.
+textColor = "#FAFAFA"                 # white text
+font = "sans serif"
+
